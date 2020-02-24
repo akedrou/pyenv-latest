@@ -14,6 +14,15 @@ does not currently uninstall old versions when upgrading.
 
 Currently only standard CPython versions are supported.
 
+## Installation
+You must have [pyenv](https://github.com/pyenv/pyenv) installed.
+
+Install as a [pyenv plugin](https://github.com/pyenv/pyenv/wiki/Plugins).
+```sh
+cd $PYENV_ROOT/plugins
+git clone https://github.com/akedrou/pyenv-latest.git
+```
+
 ## Usage
 ```sh
 pyenv install-latest 3.7
