@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# Summary: Install the latest specific Python version using python-build
+#
+# Usage: pyenv install-latest [-f] [-kvp] [<version>]
+#        pyenv install-latest -l|--list
+#        pyenv install-latest --version
+#
+#   -l/--list          List all available versions
+#   -f/--force         Install or upgrade even if the version appears to be
+#                      installed already
+#
+#   python-build options:
+#
+#   -k/--keep          Keep source tree in $PYENV_BUILD_ROOT after installation
+#                      (defaults to $PYENV_ROOT/sources)
+#   -p/--patch         Apply a patch from stdin before building
+#   -v/--verbose       Verbose mode: print compilation status to stdout
+#   --version          Show version of python-build
+#   -g/--debug         Build a debug version
+#
+# For detailed information on installing Python versions with
+# python-build, including a list of environment variables for adjusting
+# compilation, see: https://github.com/pyenv/pyenv#readme
+#
+set -e
+[ -n "$PYENV_DEBUG" ] && set -x
+
+PYENV_LATEST_ROOT=${PYENV_LATEST_ROOT:-"$PYENV_ROOT/plugins/pyenv-latest"}
+export PYENV_LATEST_ROOT
+
+# Add `share/python-alias/` directory from each pyenv plugin to the list of
+# paths where alias definitions are looked up.
+shopt -s nullglob
+for plugin_path in "$PYENV_ROOT"/plugins/*/share/python-alias; do
+  PYTHON_ALIAS_DEFINITIONS="${PYTHON_ALIAS_DEFINITIONS}:${plugin_path}"
+done
+OLDIFS=$IFS
+IFS=: PYTHON_ALIAS_DEFINITIONS=($PYTHON_ALIAS_DEFINITIONS)
+IFS=$OLDIFS
+export PYTHON_ALIAS_DEFINITIONS
+shopt -u nullglob
+
+# Provide pyenv completions
+if [ "$1" = "--complete" ]; then
+  echo --list
+  echo --force
+  echo --skip-existing
+  echo --keep
+  echo --patch
+  echo --verbose
+  echo --version
+  echo --debug
+  exec python-build --definitions
+fi
+
+usage() {
+  pyenv-help install-latest 2>/dev/null
+  [ -z "$1" ] || exit "$1"
+}
+
+aliases() {
+  local query="$1"
+  { for DEFINITION_DIR in "${PYTHON_ALIAS_DEFINITIONS[@]}"; do
+      [ -d "$DEFINITION_DIR" ] && ls "$DEFINITION_DIR"
+    done
+  } | uniq || true
+}
+
+indent() {
+  sed 's/^/  /'
+}
+
+ALIAS=""
+INSTALL_ARGS=""
+SKIP="-s"
+for arg in "$@"; do
+  case $arg in
+  "--list")
+  echo "Available versions:"
+  aliases | indent
+  exit
+  ;;
+  [-]*)
+  INSTALL_ARGS="${INSTALL_ARGS} ${arg}"
+  if [ $arg = "-f" ] || [ $arg = "--force" ]; then
+    SKIP=""
+  fi
+  ;;
+  *)
+  if [ -z $ALIAS ]; then
+    ALIAS=$arg
+  else
+    INSTALL_ARGS="${INSTALL_ARGS} ${arg}"
+  fi
+  ;;
+  esac
+done
+
+ALIAS_DEFINITION=""
+for DEFINITION_DIR in "${PYTHON_ALIAS_DEFINITIONS[@]}"; do
+  if [ -d "$DEFINITION_DIR" ] && [ -f "$DEFINITION_DIR/$ALIAS" ]; then
+    ALIAS_DEFINITION="$DEFINITION_DIR/$ALIAS"
+    break
+  fi
+done
+
+if [ -z ${ALIAS_DEFINITION} ]; then
+  echo "pyenv-latest: alias not found: ${ALIAS}" >&2
+  exit 2
+fi
+
+VERSION_NAME=$(<${ALIAS_DEFINITION})
+STATUS=0
+
+echo "Installing ${VERSION_NAME} as ${ALIAS}"
+pyenv-install $SKIP $VERSION_NAME $INSTALL_ARGS || STATUS="$?"
+
+if [ "$STATUS" != "0" ]; then
+  echo "pyenv-latest: error installing Python version. Exiting" >&2
+  exit $STATUS
+fi
+
+source ${PYENV_LATEST_ROOT}/etc/pyenv.d/common/symlink-site-packages.bash
+symlink_site_packages
+
+mkdir -p ${PYENV_ROOT}/versions/${ALIAS}
+shopt -s nullglob
+for f in "${PYENV_ROOT}/versions/${ALIAS}"/*; do
+  if [ -L $f ]; then
+    rm $f
+  fi
+done
+for f in "${PYENV_ROOT}/versions/${VERSION_NAME}"/*; do
+  ln -s $f ${PYENV_ROOT}/versions/${ALIAS}/
+done
+shopt -u nullglob
+echo "Linked $VERSION_NAME to $ALIAS"
