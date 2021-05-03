@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 #
-# Summary: Install the latest specific Python version using python-build
+# Summary: Install the latest Python micro version using python-build
 #
 # Usage: pyenv install-latest [-f] [-kvp] [<version>]
 #        pyenv install-latest -l|--list
 #        pyenv install-latest --version
 #
 #   -l/--list          List all available versions
-#   -f/--force         Install or upgrade even if the version appears to be
-#                      installed already
+#   -f/--force         Install even if the version appears to be installed
+#                      already.
+#   -u/--upgrade       If installed, check the patch version installed. Upgrade
+#                      if the latest version is newer, and otherwise skip.
 #
 #   python-build options:
 #
@@ -29,29 +31,16 @@ set -e
 PYENV_LATEST_ROOT=${PYENV_LATEST_ROOT:-"$PYENV_ROOT/plugins/pyenv-latest"}
 export PYENV_LATEST_ROOT
 
-# Add `share/python-alias/` directory from each pyenv plugin to the list of
-# paths where alias definitions are looked up.
-shopt -s nullglob
-for plugin_path in "$PYENV_ROOT"/plugins/*/share/python-alias; do
-  PYTHON_ALIAS_DEFINITIONS="${PYTHON_ALIAS_DEFINITIONS}:${plugin_path}"
-done
-OLDIFS=$IFS
-IFS=: PYTHON_ALIAS_DEFINITIONS=($PYTHON_ALIAS_DEFINITIONS)
-IFS=$OLDIFS
-export PYTHON_ALIAS_DEFINITIONS
-shopt -u nullglob
-
 # Provide pyenv completions
 if [ "$1" = "--complete" ]; then
   echo --list
   echo --force
-  echo --skip-existing
+  echo --upgrade
   echo --keep
   echo --patch
   echo --verbose
   echo --version
-  echo --debug
-  exec python-build --definitions
+  exec python-build --definitions | grep -Eo '^[[:digit:]]+\.[[:digit:]]+' | uniq
 fi
 
 usage() {
@@ -61,78 +50,192 @@ usage() {
 
 aliases() {
   local query="$1"
-  { for DEFINITION_DIR in "${PYTHON_ALIAS_DEFINITIONS[@]}"; do
-      [ -d "$DEFINITION_DIR" ] && ls "$DEFINITION_DIR"
-    done
-  } | uniq || true
+  python-build --definitions | grep -Eo '^[[:digit:]]+\.[[:digit:]]+' | uniq | $(type -ap ggrep grep | head -1) -F "$query" || true
 }
 
 indent() {
   sed 's/^/  /'
 }
 
-ALIAS=""
-INSTALL_ARGS=""
-SKIP="-s"
-for arg in "$@"; do
-  case $arg in
-  "--list")
-  echo "Available versions:"
-  aliases | indent
-  exit
-  ;;
-  [-]*)
-  INSTALL_ARGS="${INSTALL_ARGS} ${arg}"
-  if [ $arg = "-f" ] || [ $arg = "--force" ]; then
-    SKIP=""
-  fi
-  ;;
-  *)
-  if [ -z $ALIAS ]; then
-    ALIAS=$arg
-  else
-    INSTALL_ARGS="${INSTALL_ARGS} ${arg}"
-  fi
-  ;;
+unset FORCE
+unset SKIP_EXISTING
+unset UPGRADE
+unset KEEP
+unset VERBOSE
+unset HAS_PATCH
+
+# Load shared library functions
+eval "$(python-build --lib)"
+
+parse_options "$@"
+for option in "${OPTIONS[@]}"; do
+  case "$option" in
+  "h" | "help" )
+    usage 0
+    ;;
+  "l" | "list" )
+    echo "Available versions:"
+    aliases | indent
+    exit
+    ;;
+  "f" | "force" )
+    FORCE=true
+    ;;
+  "s" | "skip-existing" )
+    SKIP_EXISTING=true
+    ;;
+  "k" | "keep" )
+    [ -n "${PYENV_BUILD_ROOT}" ] || PYENV_BUILD_ROOT="${PYENV_ROOT}/sources"
+    ;;
+  "v" | "verbose" )
+    VERBOSE="-v"
+    ;;
+  "p" | "patch" )
+    HAS_PATCH="-p"
+    ;;
+  "version" )
+    exec python-build --version
+    ;;
+  * )
+    usage 1 >&2
+    ;;
   esac
 done
 
-ALIAS_DEFINITION=""
-for DEFINITION_DIR in "${PYTHON_ALIAS_DEFINITIONS[@]}"; do
-  if [ -d "$DEFINITION_DIR" ] && [ -f "$DEFINITION_DIR/$ALIAS" ]; then
-    ALIAS_DEFINITION="$DEFINITION_DIR/$ALIAS"
-    break
-  fi
-done
+[ "${#ARGUMENTS[@]}" -le 1 ] || usage 1 >&2
 
-if [ -z ${ALIAS_DEFINITION} ]; then
-  echo "pyenv-latest: alias not found: ${ALIAS}" >&2
-  exit 2
+unset CURRENT_VERSION
+unset VERSION_NAME
+unset UPGRADE_STATUS
+DEFINITION_ALIAS="${ARGUMENTS[0]}" # TODO: support non-CPython versions
+DEFINITION_CANDIDATES=($(python-build --definitions | grep "^${DEFINITION_ALIAS}" | sed -e '/-dev$/d' -e '/-src$/d' | sort -t. -k1,1r -k 2,2nr -k 3,3nr || true))
+DEFINITION="${DEFINITION_CANDIDATES}"
+VERSION_NAME="${DEFINITION##*/}"
+
+if [ -f "${PREFIX}/version" ]; then
+  CURRENT_VERSION="$(<${PREFIX}/version)"
+  if [ "v${CURRENT_VERSION}" == "v${VERSION_NAME}" ]; then
+    UPGRADE_STATUS=0
+  else
+    UPGRADE_STATUS=1
+  fi
+else
+  UPGRADE_STATUS=2
 fi
 
-VERSION_NAME=$(<${ALIAS_DEFINITION})
+# Define `before_install` and `after_install` functions that allow
+# plugin hooks to register a string of code for execution before or
+# after the installation process.
+declare -a before_hooks after_hooks
+
+before_install() {
+  local hook="$1"
+  before_hooks["${#before_hooks[@]}"]="$hook"
+}
+
+after_install() {
+  local hook="$1"
+  after_hooks["${#after_hooks[@]}"]="$hook"
+}
+
+OLDIFS="$IFS"
+IFS=$'\n' scripts=(`pyenv-hooks install`)
+IFS="$OLDIFS"
+for script in "${scripts[@]}"; do source "$script"; done
+
+[ -d "${PREFIX}" ] && PREFIX_EXISTS=1
+
+# If the installation prefix exists, prompt for confirmation unless
+# the --force option was specified.
+if [ -d "${PREFIX}/bin" ]; then
+  upgrade_prompt=""
+  if [ -gt "${UPGRADE_STATUS}" 0 ]; then
+    upgrade_prompt="you can upgrade ${PREFIX} from ${CURRENT_VERSION} to ${VERSION_NAME}."
+  else
+    upgrade_prompt="${PREFIX} is already on the latest available version ${CURRENT_VERSION}."
+  fi
+  if [ -z "$UPGRADE" ] && [ -z "$FORCE" ] && [ -z "$SKIP_EXISTING" ]; then
+    echo "pyenv: $PREFIX already exists" >&2
+    echo "$upgrade_prompt" >&2
+    read -p "continue with installation? (y/N) "
+
+    case "$REPLY" in
+    y | Y | yes | YES ) ;;
+    * ) exit 1 ;;
+    esac
+  elif [ -eq ${UPGRADE_STATUS} 0 ] && [ -z "${UPGRADE}" ] && [ -n "$SKIP_EXISTING" ] ; then
+    # Since we know the python version is already installed, and are opting to
+    # not force installation of existing versions, we just `exit 0` here to
+    # leave things happy
+    exit 0
+  fi
+fi
+
+# If PYENV_BUILD_ROOT is set, always pass keep options to python-build.
+if [ -n "${PYENV_BUILD_ROOT}" ]; then
+  export PYTHON_BUILD_BUILD_PATH="${PYENV_BUILD_ROOT}/${VERSION_NAME}"
+  KEEP="-k"
+fi
+
+# Set PYTHON_BUILD_CACHE_PATH to $PYENV_ROOT/cache, if the directory
+# exists and the variable is not already set.
+if [ -z "${PYTHON_BUILD_CACHE_PATH}" ] && [ -d "${PYENV_ROOT}/cache" ]; then
+  export PYTHON_BUILD_CACHE_PATH="${PYENV_ROOT}/cache"
+fi
+
+# Since pyenv-latest only supports CPython, this could be simplified some, but
+# it's easier to maintain with the main install script by copying it.
+if [ -z "${PYENV_BOOTSTRAP_VERSION}" ]; then
+  case "${VERSION_NAME}" in
+  [23]"."* )
+    # Default PYENV_VERSION to the friendly Python version. (The
+    # CPython installer requires an existing Python installation to run. An
+    # unsatisfied local .python-version file can cause the installer to
+    # fail.)
+    for version_info in "${VERSION_NAME%-dev}" "${VERSION_NAME%.*}" "${VERSION_NAME%%.*}"; do
+      # Anaconda's `curl` doesn't work on platform where `/etc/pki/tls/certs/ca-bundle.crt` isn't available (e.g. Debian)
+      for version in $(pyenv-whence "python${version_info}" 2>/dev/null || true); do
+        if [[ "${version}" != "anaconda"* ]] && [[ "${version}" != "miniconda"* ]]; then
+          PYENV_BOOTSTRAP_VERSION="${version}"
+          break 2
+        fi
+      done
+    done
+    ;;
+  esac
+fi
+
+if [ -n "${PYENV_BOOTSTRAP_VERSION}" ]; then
+  export PYENV_VERSION="${PYENV_BOOTSTRAP_VERSION}"
+fi
+
+# Execute `before_install` hooks.
+for hook in "${before_hooks[@]}"; do eval "$hook"; done
+
+# Plan cleanup on unsuccessful installation.
+cleanup() {
+  [ -z "${PREFIX_EXISTS}" ] && rm -rf "$PREFIX"
+}
+
+trap cleanup SIGINT
+
+# Invoke `python-build` and record the exit status in $STATUS.
 STATUS=0
+python-build $KEEP $VERBOSE $HAS_PATCH $DEBUG "$DEFINITION" "$PREFIX" || STATUS="$?"
 
-echo "Installing ${VERSION_NAME} as ${ALIAS}"
-pyenv-install $SKIP $VERSION_NAME $INSTALL_ARGS || STATUS="$?"
+# Execute `after_install` hooks.
+for hook in "${after_hooks[@]}"; do eval "$hook"; done
 
-if [ "$STATUS" != "0" ]; then
-  echo "pyenv-latest: error installing Python version. Exiting" >&2
-  exit $STATUS
+# Run `pyenv-rehash` after a successful installation.
+if [ "$STATUS" == "0" ]; then
+  pyenv-rehash
+  source ${PYENV_LATEST_ROOT}/etc/pyenv.d/common/symlink-site-packages.bash
+  symlink_site_packages
+
+  echo $VERSION_NAME > ${PYENV_ROOT}/versions/${ALIAS}/version
+  echo "Linked $VERSION_NAME to $ALIAS"
+else
+  cleanup
 fi
 
-source ${PYENV_LATEST_ROOT}/etc/pyenv.d/common/symlink-site-packages.bash
-symlink_site_packages
-
-mkdir -p ${PYENV_ROOT}/versions/${ALIAS}
-shopt -s nullglob
-for f in "${PYENV_ROOT}/versions/${ALIAS}"/*; do
-  if [ -L $f ]; then
-    rm $f
-  fi
-done
-for f in "${PYENV_ROOT}/versions/${VERSION_NAME}"/*; do
-  ln -s $f ${PYENV_ROOT}/versions/${ALIAS}/
-done
-shopt -u nullglob
-echo "Linked $VERSION_NAME to $ALIAS"
+exit "$STATUS"
