@@ -78,6 +78,9 @@ for option in "${OPTIONS[@]}"; do
     aliases | indent
     exit
     ;;
+  "u" | "upgrade" )
+    UPGRADE=true
+    ;;
   "f" | "force" )
     FORCE=true
     ;;
@@ -105,23 +108,13 @@ done
 [ "${#ARGUMENTS[@]}" -le 1 ] || usage 1 >&2
 
 unset CURRENT_VERSION
+unset PREFIX_EXISTS
 unset VERSION_NAME
 unset UPGRADE_STATUS
 DEFINITION_ALIAS="${ARGUMENTS[0]}" # TODO: support non-CPython versions
 DEFINITION_CANDIDATES=($(python-build --definitions | grep "^${DEFINITION_ALIAS}" | sed -e '/-dev$/d' -e '/-src$/d' | sort -t. -k1,1r -k 2,2nr -k 3,3nr || true))
 DEFINITION="${DEFINITION_CANDIDATES}"
 VERSION_NAME="${DEFINITION##*/}"
-
-if [ -f "${PREFIX}/version" ]; then
-  CURRENT_VERSION="$(<${PREFIX}/version)"
-  if [ "v${CURRENT_VERSION}" == "v${VERSION_NAME}" ]; then
-    UPGRADE_STATUS=0
-  else
-    UPGRADE_STATUS=1
-  fi
-else
-  UPGRADE_STATUS=2
-fi
 
 # Define `before_install` and `after_install` functions that allow
 # plugin hooks to register a string of code for execution before or
@@ -143,18 +136,33 @@ IFS=$'\n' scripts=(`pyenv-hooks install`)
 IFS="$OLDIFS"
 for script in "${scripts[@]}"; do source "$script"; done
 
+PREFIX="${PYENV_ROOT}/versions/${DEFINITION_ALIAS}"
+
 [ -d "${PREFIX}" ] && PREFIX_EXISTS=1
+
+if [ -f "${PREFIX}/version" ]; then
+  CURRENT_VERSION="$(<${PREFIX}/version)"
+  if [ "v${CURRENT_VERSION}" == "v${VERSION_NAME}" ]; then
+    UPGRADE_STATUS=0
+  else
+    UPGRADE_STATUS=1
+  fi
+else
+  UPGRADE_STATUS=2
+fi
+
+echo $UPGRADE_STATUS
 
 # If the installation prefix exists, prompt for confirmation unless
 # the --force option was specified.
 if [ -d "${PREFIX}/bin" ]; then
   upgrade_prompt=""
-  if [ -gt "${UPGRADE_STATUS}" 0 ]; then
-    upgrade_prompt="you can upgrade ${PREFIX} from ${CURRENT_VERSION} to ${VERSION_NAME}."
+  if (( ${UPGRADE_STATUS} > 0 )); then
+    upgrade_prompt="you can upgrade ${DEFINITION_ALIAS} from ${CURRENT_VERSION} to ${VERSION_NAME}."
   else
-    upgrade_prompt="${PREFIX} is already on the latest available version ${CURRENT_VERSION}."
+    upgrade_prompt="${DEFINITION_ALIAS} is already on the latest available version ${CURRENT_VERSION}."
   fi
-  if [ -z "$UPGRADE" ] && [ -z "$FORCE" ] && [ -z "$SKIP_EXISTING" ]; then
+  if ( [ -z "$UPGRADE" ] || ( [ -n "$UPGRADE" ] && (( ${UPGRADE_STATUS} == 0 )) ) ) && [ -z "$FORCE" ] && [ -z "$SKIP_EXISTING" ]; then
     echo "pyenv: $PREFIX already exists" >&2
     echo "$upgrade_prompt" >&2
     read -p "continue with installation? (y/N) "
@@ -163,7 +171,7 @@ if [ -d "${PREFIX}/bin" ]; then
     y | Y | yes | YES ) ;;
     * ) exit 1 ;;
     esac
-  elif [ -eq ${UPGRADE_STATUS} 0 ] && [ -z "${UPGRADE}" ] && [ -n "$SKIP_EXISTING" ] ; then
+  elif (( ${UPGRADE_STATUS} == 0 )) && [ -z "${UPGRADE}" ] && [ -n "$SKIP_EXISTING" ] ; then
     # Since we know the python version is already installed, and are opting to
     # not force installation of existing versions, we just `exit 0` here to
     # leave things happy
@@ -230,10 +238,10 @@ for hook in "${after_hooks[@]}"; do eval "$hook"; done
 if [ "$STATUS" == "0" ]; then
   pyenv-rehash
   source ${PYENV_LATEST_ROOT}/etc/pyenv.d/common/symlink-site-packages.bash
-  symlink_site_packages
+  symlink_site_packages ${DEFINITION_ALIAS}
 
-  echo $VERSION_NAME > ${PYENV_ROOT}/versions/${ALIAS}/version
-  echo "Linked $VERSION_NAME to $ALIAS"
+  echo $VERSION_NAME > ${PYENV_ROOT}/versions/${DEFINITION_ALIAS}/version
+  echo "Linked ${VERSION_NAME} to ${DEFINITION_ALIAS}"
 else
   cleanup
 fi
